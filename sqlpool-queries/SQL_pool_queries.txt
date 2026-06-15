@@ -1,0 +1,76 @@
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = '<<Password>>'
+-- creating scope
+CREATE DATABASE SCOPED CREDENTIAL storage_credential
+WITH IDENTITY='Managed Identity';
+
+-- defining data source
+CREATE EXTERNAL DATA SOURCE gold_data_source
+WITH (
+    TYPE= HADOOP,
+    LOCATION = 'abfss://<<container>>@<<Storageaccount_name>>.core.windows.net/',
+    CREDENTIAL = storage_credential
+)
+
+-- define format
+CREATE EXTERNAL FILE FORMAT parquetFileFormat
+WITH (
+    FORMAT_TYPE = PARQUET
+);
+
+-- create tables 
+-- patient dimention 
+CREATE EXTERNAL TABLE dbo.dim_patient (
+    patient_id VARCHAR (50),
+    gender VARCHAR(10),
+    age INT,
+    effective_from DATETIME2,
+    surrogate_key BIGINT,
+    effective_to DATETIME2,
+    is_current BIT
+)
+WITH (
+    LOCATION = 'dim_patient/',
+    DATA_SOURCE = gold_data_source,
+    FILE_FORMAT = parquetFileFormat
+)
+
+--department dimenstion
+CREATE EXTERNAL TABLE dbo.dim_department (
+    department NVARCHAR (200),
+    hospital_id INT,
+    surrogate_key BIGINT
+)
+WITH(
+    LOCATION='dim_department/',
+    DATA_SOURCE = gold_data_source,
+    FILE_FORMAT = parquetFileFormat
+);
+
+IF EXISTS (
+    SELECT *
+    FROM sys.external_tables
+    WHERE name = 'fact_patient_flow'
+      AND schema_id = SCHEMA_ID('dbo')
+)
+DROP EXTERNAL TABLE dbo.fact_patient_flow;
+GO
+--fact table
+CREATE EXTERNAL TABLE dbo.fact_patient_flow (
+    fact_id BIGINT,
+    patient_sk BIGINT,
+    department_sk BIGINT,
+    admission_time DATETIME2,
+    discharge_time DATETIME2,
+    admission_date DATE,
+    length_of_stay FLOAT,
+    is_currently_admitted BIT,
+    bed_id INT,
+    event_ingestion_time DATETIME2
+)
+WITH(
+    LOCATION='fact_patient_flow/',
+    DATA_SOURCE = gold_data_source,
+    FILE_FORMAT = parquetFileFormat
+);
+
+SELECT * FROM dbo.fact_patient_flow

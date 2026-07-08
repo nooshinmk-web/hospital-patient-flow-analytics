@@ -1,23 +1,34 @@
 from pyspark.sql.types import *
 from pyspark.sql.functions import *
+from delta.tables import DeltaTable
 
-#ADLS configuration 
+# -------------------------
+# ADLS Configuration 
+# -------------------------
 spark.conf.set(
-  "fs.azure.account.key.<<Storageaccount_name>>.dfs.core.windows.net",
-  "<<Storage_Account_access_key>>"
+    "fs.azure.account.key.<<storageaccount_name>>.dfs.core.windows.net",
+   "<<storage_account_access_key>>"
 )
-bronze_path = "abfss://<<container>>@<<Storageaccount_name>>.core.windows.net/<<path>>"
-silver_path = "abfss://<<container>>@<<Storageaccount_name>>.core.windows.net/<<path>>"
 
-#read from bronze
+spark.conf.set(
+    "spark.databricks.delta.schema.autoMerge.enabled",
+    "true"
+)
+bronze_path = "abfss://<<bronze_container>>@<<storageaccount_name>>.dfs.core.windows.net/<<file_path>>"
+silver_path = "abfss://<<silver_container>>@<<storageaccount_name>>.dfs.core.windows.net/<<file_path>>"
+
+# -------------------------
+# Read from Bronze
+# -------------------------
 bronze_df =   ( 
     spark.readStream
   .format("delta")
   .load(bronze_path)
 )
-#silver_df = bronze_df.select("id","name","age","salary")
-#silver_df.writeStream.format("delta").option("checkpointLocation", "abfss://silver@hospitalpatientstorage.dfs.core.windows.net/p
-#Define Schema
+
+# -------------------------
+# Define Schema
+# -------------------------
 schema = StructType([
   StructField("patient_id", StringType()),
   StructField("gender", StringType()),
@@ -28,44 +39,58 @@ schema = StructType([
   StructField("bed_id", IntegerType()),
   StructField("hospital_id", IntegerType()),
 
-  # NEW ML / enrichment fields
+# NEW ML / enrichment fields
   StructField("clinical_note", StringType()),
   StructField("stay_days", IntegerType()),
   StructField("intent_label", StringType())
 ])
- 
- #parse it to dataframe
+
+# -------------------------
+# Parse JSON to Dataframe
+# -------------------------
 parsed_df = bronze_df.withColumn("data", from_json(col("raw_json"), schema)).select("data.*")
- #convert type to Timestamp
+
+# -------------------------
+# 1. Schema Evolution
+# -------------------------
+expected_cols = ["patient_id","gender","age","department","admission_time","discharge_time","bed_id","hospital_id"]
+for col_name in expected_cols:
+   if col_name not in parsed_df.columns:
+     clean_df = clean_df.withColumn(col_name, lit(None).cast(dtype))
+
+# -------------------------
+# 2. Data Cleansing
+# -------------------------
+# Type conversion
 clean_df = parsed_df.withColumn(
      "admission_time", 
      to_timestamp("admission_time"))
 clean_df = parsed_df.withColumn(
      "discharge_time", 
      to_timestamp("discharge_time"))
- #invalid admission_time
+# Handle invalid timestamps
 clean_df = clean_df.withColumn("admission_time", 
                                 when(   
-                                (col("admission_time").isNull())| (col("admission_time") > current_timestamp())
-                                , current_timestamp()
+                                    (col("admission_time").isNull())| 
+                                    (col("admission_time") > current_timestamp()), 
+                                    current_timestamp()
                                 ).otherwise(col("admission_time"))
-                                )
- #Handle Invalid Age
+                            )
+# Handle Invalid Age
 clean_df = clean_df.withColumn("age", 
                                 when(   
-                                (col("age") < 0) | (col("age") > 100),
-                                floor(rand()*90+1).cast("int")
-                                ).otherwise(col("age"))
-                                )
- #Schema evolution
-expected_cols = ["patient_id","gender","age","department","admission_time","discharge_time","bed_id","hospital_id"]
-for col_name in expected_cols:
-   if col_name not in clean_df.columns:
-     clean_df = clean_df.withColumn(col_name, lit(None).cast(dtype))
-# -------------------------
-# ENRICHMENT STEP
-# -------------------------
+                                 (col("age") < 0) | (col("age") > 100),
+                                 floor(rand()*90+1).cast("int")
+                              ).otherwise(col("age"))
+                             )
+# Deduplication
+clean_df = clean_df.dropDuplicates(
+    ["patient_id", "hospital_id", "admission_time"]
+)
 
+# -------------------------
+# 3. Data Enrichment
+# -------------------------
 enriched_df = (
     clean_df
     .withColumn(
@@ -244,11 +269,48 @@ enriched_df = enriched_df.withColumn(
     .when(col("department") == "Emergency", lit("emergency_case"))
     .otherwise(lit("general_case"))
 )
- #write to silver
-(enriched_df.writeStream
-  .format("delta")
-  .outputMode("append")
-  .option("mergeSchema", "true")
-  .option("checkpointLocation", silver_path + "_checkpoint")
-  .start(silver_path)
- )
+
+# -------------------------
+# 4. Text Cleaning
+# -------------------------
+silver_df = (
+        enriched_df
+        .dropna(subset=["clinical_note", "intent_label"])
+        .withColumn(
+            "clean_text",
+            trim(lower(regexp_replace(col("clinical_note"), "[^a-zA-Z ]", ""))))
+    )
+
+# Validation
+#df.select(count(when(col("clinical_note").isNull(), True)).alias("Null Notes"),count(when(col("intent_label").isNull(), True)).alias("Null Labels")).show()
+#df.groupBy("intent_label").count().show()
+#df_clean.show(100)
+
+# -------------------------
+# Write to Silver
+# -------------------------
+def upsert_to_silver(batch_df, batch_id):
+
+    deltaTable = DeltaTable.forPath(spark, silver_path)
+
+    (
+        deltaTable.alias("t")
+        .merge(
+            batch_df.alias("s"),
+            """
+            t.patient_id = s.patient_id
+            AND t.hospital_id = s.hospital_id
+            AND t.admission_time = s.admission_time
+            """
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+(silver_df.writeStream
+    .foreachBatch(upsert_to_silver)
+    .option("checkpointLocation", silver_path + "_checkpoint")
+    .start()
+)
+
